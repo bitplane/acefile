@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 import glob
+import io
 import os
+import random
 import re
 import struct
 import sys
@@ -81,6 +83,74 @@ def test_writer_roundtrip(tmp_path):
         assert archive.testall() == None
 
 
+def test_bit_writer_roundtrip():
+    values = [(1, 1), (2, 2), (0x1234, 16), (0, 3), (0x7FFFFFFF, 31)]
+    output = io.BytesIO()
+    writer = acefile.BitWriter(output)
+    for value, bits in values:
+        writer.write_bits(value, bits)
+    writer.finish()
+    output.seek(0)
+    reader = acefile.BitStream(output)
+    assert [reader.read_bits(bits) for _, bits in values] == \
+            [value for value, _ in values]
+
+
+def test_writer_compresses_and_falls_back_per_member(tmp_path):
+    rng = random.Random(1)
+    incompressible = bytes(rng.randrange(256) for _ in range(10000))
+    with acefile.open(tmp_path / 'test.ace', 'w') as archive:
+        archive.writestr('compressed', b'abcd' * 1000)
+        archive.writestr('tiny', b'hello')
+        archive.writestr('incompressible', incompressible)
+
+    with acefile.open(tmp_path / 'test.ace') as archive:
+        compressed = archive.getmember('compressed')
+        assert compressed.comptype == acefile.COMP_LZ77
+        assert compressed.compqual == acefile.QUAL_NORMAL
+        assert compressed.dicsize == 1 << 20
+        assert compressed.packsize < compressed.size
+        assert archive.read(compressed) == b'abcd' * 1000
+        assert archive.getmember('tiny').comptype == acefile.COMP_STORED
+        stored = archive.getmember('incompressible')
+        assert stored.comptype == acefile.COMP_STORED
+        assert stored.packsize == stored.size
+        assert archive.read(stored) == incompressible
+
+
+def test_lz77_writer_multiple_blocks():
+    rng = random.Random(2)
+    data = bytes(rng.randrange(256) for _ in range(40000))
+    compressed = io.BytesIO()
+    acefile.LZ77Writer.write(compressed, data)
+    compressed.seek(0)
+    decompressor = acefile.ACE()
+    assert b''.join(decompressor.decompress_lz77(
+            compressed, len(data), 1 << 20)) == data
+
+
+@pytest.mark.parametrize('gap, repeated, expected', [
+        (253, b'abc', (268, 255, 1)),
+        (300, b'abc', (269, 302, 0)),
+        (9000, b'abcd', (274, 9003, 0)),
+])
+def test_lz77_writer_distance_thresholds(gap, repeated, expected):
+    rng = random.Random(gap)
+    middle = bytes(rng.randrange(256) for _ in range(gap))
+    assert list(acefile.LZ77Writer._tokens(
+            repeated + middle + repeated))[-1] == expected
+
+
+def test_writer_explicit_store(tmp_path):
+    with acefile.open(tmp_path / 'test.ace', 'w',
+                      compression=acefile.COMP_STORED) as archive:
+        archive.writestr('repeated', b'abcd' * 1000)
+    with acefile.open(tmp_path / 'test.ace') as archive:
+        member = archive.getmember(0)
+        assert member.comptype == acefile.COMP_STORED
+        assert member.packsize == member.size
+
+
 def test_writer_rejects_duplicate_names_without_partial_member(tmp_path):
     archive_path = tmp_path / 'test.ace'
     with acefile.open(archive_path, 'w') as archive:
@@ -121,9 +191,9 @@ def test_writer_validates_arguments(tmp_path):
             archive.writestr('drive:c', b'data')
         with pytest.raises(ValueError, match='archive to itself'):
             archive.write(tmp_path / 'test.ace')
-    with pytest.raises(NotImplementedError, match='stored compression'):
+    with pytest.raises(NotImplementedError, match='compression method'):
         acefile.open(tmp_path / 'compressed.ace', 'w',
-                     compression=acefile.COMP_LZ77)
+                     compression=acefile.COMP_BLOCKED)
 
 
 def test_writer_file64_header(tmp_path):
@@ -142,7 +212,7 @@ def test_writer_cli(tmp_path, monkeypatch):
     tree = tmp_path / 'tree'
     tree.mkdir()
     monkeypatch.chdir(tmp_path)
-    (tree / 'input.txt').write_bytes(b'hello')
+    (tree / 'input.txt').write_bytes(b'hello' * 1000)
     (tree / 'output.ace').write_bytes(b'old archive')
     monkeypatch.setattr(sys, 'argv',
             ['acefile-ace', 'tree/output.ace', 'tree'])
@@ -151,7 +221,8 @@ def test_writer_cli(tmp_path, monkeypatch):
     assert exc.value.code == 0
     with acefile.open('tree/output.ace') as archive:
         assert archive.getnames() == ['tree', os.path.join('tree', 'input.txt')]
-        assert archive.read(1) == b'hello'
+        assert archive.getmember(1).comptype == acefile.COMP_LZ77
+        assert archive.read(1) == b'hello' * 1000
     before = (tree / 'output.ace').read_bytes()
     monkeypatch.setattr(sys, 'argv',
             ['acefile-ace', 'tree/output.ace', 'missing'])
@@ -159,6 +230,14 @@ def test_writer_cli(tmp_path, monkeypatch):
         acefile.ace()
     assert exc.value.code == 1
     assert (tree / 'output.ace').read_bytes() == before
+
+    monkeypatch.setattr(sys, 'argv',
+            ['acefile-ace', '--store', 'stored.ace', 'tree/input.txt'])
+    with pytest.raises(SystemExit) as exc:
+        acefile.ace()
+    assert exc.value.code == 0
+    with acefile.open('stored.ace') as archive:
+        assert archive.getmember(0).comptype == acefile.COMP_STORED
 
 
 

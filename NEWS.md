@@ -1,7 +1,8 @@
 ### Unreleased
 
--   Add creation of single-volume ACE 2.0 archives using stored compression,
-    including a library API and `acefile-ace` command line utility.
+-   Add creation of single-volume ACE 2.0 archives using LZ77 compression,
+    with automatic stored fallback, a library API and an `acefile-ace` command
+    line utility.
 -   Decode archive member filenames as CP850 by default and allow callers to
     select a different filename encoding.
 
@@ -195,5 +196,4 @@
 ### acefile 0.2.1 2017-06-17
 
 First public release.
-
 

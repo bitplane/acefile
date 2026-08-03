@@ -30,8 +30,7 @@
 # over ACE technology beyond the copyright of this python implementation.
 
 """
-Read/test/extract ACE archives and create stored ACE 2.0 archives in pure
-python.
+Read/test/extract and create ACE archives in pure python.
 
 This single-file, pure python 3, no-dependencies implementation is intended
 to be used as a library, but also provides stand-alone ace and unace utilities.
@@ -41,7 +40,7 @@ native implementations, but more robust against vulnerabilities.
 This implementation supports up to version 2.0 of the ACE archive format,
 including the EXE, DELTA, PIC and SOUND modes of ACE 2.0, password protected
 archives and multi-volume archives.  It can create single-volume ACE 2.0
-archives using stored compression.
+archives using LZ77 compression with automatic stored fallback.
 It is an implementation from scratch, based on the 1998 document titled
 "Technical information of the archiver ACE v1.2" by Marcel Lemke, using
 unace 2.5 and WinAce 2.69 by Marcel Lemke as reference implementations.
@@ -73,6 +72,7 @@ import datetime
 import errno
 import io
 import math
+import mmap
 import os
 import platform
 import re
@@ -3425,9 +3425,244 @@ class AceVolume:
 
 
 
+class BitWriter:
+    """Write ACE's little-endian-word, most-significant-bit-first stream."""
+
+    def __init__(self, f):
+        self.__file = f
+        self.__bits = 0
+        self.__count = 0
+
+    def write_bits(self, value, bits):
+        if bits < 0 or value < 0 or value >= 1 << bits:
+            raise ValueError("value does not fit in bit width")
+        self.__bits = (self.__bits << bits) | value
+        self.__count += bits
+        while self.__count >= 32:
+            shift = self.__count - 32
+            word = self.__bits >> shift
+            self.__file.write(struct.pack('<L', word))
+            self.__bits &= (1 << shift) - 1
+            self.__count = shift
+
+    def finish(self):
+        if self.__count > 0:
+            self.__file.write(struct.pack(
+                    '<L', self.__bits << (32 - self.__count)))
+            self.__bits = 0
+            self.__count = 0
+
+
+class LZ77Writer:
+    """Encode plain ACE LZ77 streams using bounded-memory greedy matching."""
+
+    DICBITS = 20
+    DICSIZE = 1 << DICBITS
+    HASHBITS = 16
+    HASHSIZE = 1 << HASHBITS
+    MAXCHAIN = 64
+    MAXTOKENS = (1 << 15) - 1
+    MAXMATCH = 258
+
+    @staticmethod
+    def _balanced_widths(frequencies, max_width):
+        used = [symbol for symbol, count in enumerate(frequencies) if count]
+        widths = [0] * len(frequencies)
+        if not used:
+            widths[0] = 1
+            return widths
+        if len(used) == 1:
+            widths[used[0]] = 1
+            return widths
+        width = (len(used) - 1).bit_length()
+        if width > max_width:
+            raise ValueError("too many Huffman symbols")
+        short = (1 << width) - len(used)
+        used.sort(key=lambda symbol: (-frequencies[symbol], symbol))
+        for symbol in used[:short]:
+            widths[symbol] = width - 1
+        for symbol in used[short:]:
+            widths[symbol] = width
+        return widths
+
+    @staticmethod
+    def _codes(widths, max_width, trim=True):
+        if trim:
+            last = max(i for i, width in enumerate(widths) if width)
+            widths = widths[:last + 1]
+        tree = Huffman._make_tree(list(widths), max_width)
+        codes = {}
+        for symbol, width in enumerate(widths):
+            if width == 0:
+                continue
+            expanded = tree.codes.index(symbol)
+            codes[symbol] = (expanded >> (max_width - width), width)
+        return codes
+
+    @classmethod
+    def _write_tree(cls, writer, widths, max_width):
+        last = max(i for i, width in enumerate(widths) if width)
+        widths = widths[:last + 1]
+        positive = [width for width in widths if width]
+        lower_width = min(positive) - 1
+        reduced = [0 if width == 0 else width - lower_width
+                   for width in widths]
+        upper_width = max(reduced) + 1
+
+        deltas = [reduced[0]]
+        deltas.extend((reduced[i] - reduced[i - 1]) % upper_width
+                      for i in range(1, len(reduced)))
+        encoded = []
+        i = 0
+        while i < len(deltas):
+            if deltas[i] == 0:
+                run = 1
+                while i + run < len(deltas) and deltas[i + run] == 0:
+                    run += 1
+                while run >= 4:
+                    length = min(run, 19)
+                    encoded.append((upper_width, length - 4))
+                    run -= length
+                encoded.extend((0, None) for _ in range(run))
+                while i < len(deltas) and deltas[i] == 0:
+                    i += 1
+                continue
+            encoded.append((deltas[i], None))
+            i += 1
+
+        frequencies = [0] * (upper_width + 1)
+        for symbol, _ in encoded:
+            frequencies[symbol] += 1
+        width_widths = cls._balanced_widths(
+                frequencies, Huffman.MAXWIDTHWIDTH)
+        width_codes = cls._codes(
+                width_widths, Huffman.MAXWIDTHWIDTH, trim=False)
+
+        writer.write_bits(len(widths) - 1, 9)
+        writer.write_bits(lower_width, 4)
+        writer.write_bits(upper_width, 4)
+        for width in width_widths:
+            writer.write_bits(width, Huffman.WIDTHWIDTHBITS)
+        for symbol, extra in encoded:
+            code, bits = width_codes[symbol]
+            writer.write_bits(code, bits)
+            if extra is not None:
+                writer.write_bits(extra, 4)
+
+    @staticmethod
+    def _hash(data, pos):
+        return ((data[pos] * 251 + data[pos + 1]) * 251 +
+                data[pos + 2]) & (LZ77Writer.HASHSIZE - 1)
+
+    @classmethod
+    def _tokens(cls, data):
+        heads = array.array('i', [-1]) * cls.HASHSIZE
+        previous = array.array('i', [-1]) * cls.DICSIZE
+        size = len(data)
+        pos = 0
+
+        def insert(index):
+            if index + 2 >= size:
+                return
+            key = cls._hash(data, index)
+            previous[index & (cls.DICSIZE - 1)] = heads[key]
+            heads[key] = index
+
+        while pos < size:
+            best_length = 0
+            best_distance = 0
+            if pos + 2 < size:
+                key = cls._hash(data, pos)
+                candidate = heads[key]
+                checked = 0
+                while candidate >= 0 and checked < cls.MAXCHAIN:
+                    distance = pos - candidate
+                    if distance > cls.DICSIZE:
+                        break
+                    value = distance - 1
+                    max_length = 256 if value <= LZ77.MAXDISTATLEN2 else \
+                            257 if value <= LZ77.MAXDISTATLEN3 else 258
+                    limit = min(max_length, size - pos)
+                    length = 0
+                    while length < limit and \
+                            data[candidate + length] == data[pos + length]:
+                        length += 1
+                    minimum = 4 if distance - 1 > LZ77.MAXDISTATLEN3 else 3
+                    if length >= minimum and (length > best_length or
+                            (length == best_length and
+                             distance < best_distance)):
+                        best_length = length
+                        best_distance = distance
+                        if length == limit:
+                            break
+                    candidate = previous[candidate & (cls.DICSIZE - 1)]
+                    checked += 1
+
+            insert(pos)
+            if best_length == 0:
+                yield (data[pos], None, None)
+                pos += 1
+                continue
+
+            value = best_distance - 1
+            distance_bits = value.bit_length()
+            symbol = 260 + distance_bits
+            adjustment = 2 if value <= LZ77.MAXDISTATLEN2 else \
+                    3 if value <= LZ77.MAXDISTATLEN3 else 4
+            yield (symbol, value, best_length - adjustment)
+            for index in range(pos + 1, pos + best_length):
+                insert(index)
+            pos += best_length
+
+    @classmethod
+    def _write_block(cls, writer, tokens):
+        main_frequencies = [0] * LZ77.NUMMAINCODES
+        len_frequencies = [0] * LZ77.NUMLENCODES
+        for symbol, _, length in tokens:
+            main_frequencies[symbol] += 1
+            if length is not None:
+                len_frequencies[length] += 1
+        if not any(len_frequencies):
+            len_frequencies[0] = 1
+        main_widths = cls._balanced_widths(
+                main_frequencies, LZ77.MAXCODEWIDTH)
+        len_widths = cls._balanced_widths(
+                len_frequencies, LZ77.MAXCODEWIDTH)
+        main_codes = cls._codes(main_widths, LZ77.MAXCODEWIDTH)
+        len_codes = cls._codes(len_widths, LZ77.MAXCODEWIDTH)
+
+        cls._write_tree(writer, main_widths, LZ77.MAXCODEWIDTH)
+        cls._write_tree(writer, len_widths, LZ77.MAXCODEWIDTH)
+        writer.write_bits(len(tokens), 15)
+        for symbol, distance, length in tokens:
+            code, bits = main_codes[symbol]
+            writer.write_bits(code, bits)
+            if distance is None:
+                continue
+            distance_bits = symbol - 260
+            if distance_bits >= 2:
+                writer.write_bits(distance - (1 << (distance_bits - 1)),
+                                  distance_bits - 1)
+            code, bits = len_codes[length]
+            writer.write_bits(code, bits)
+
+    @classmethod
+    def write(cls, f, data):
+        writer = BitWriter(f)
+        block = []
+        for token in cls._tokens(data):
+            block.append(token)
+            if len(block) == cls.MAXTOKENS:
+                cls._write_block(writer, block)
+                block = []
+        if block:
+            cls._write_block(writer, block)
+        writer.finish()
+
+
 class AceWriter:
     """
-    Create a single-volume ACE 2.0 archive using stored compression.
+    Create a single-volume ACE 2.0 archive using LZ77 compression.
 
     Instances are returned by calling :func:`acefile.open` with mode ``'w'``.
 
@@ -3442,13 +3677,14 @@ class AceWriter:
     """
 
     def __init__(self, file, mode='w', *, encoding='cp850',
-                 compression=Header.COMP_STORED):
+                 compression=Header.COMP_LZ77):
         if mode != 'w':
             raise ValueError("mode must be 'w'")
-        if compression != Header.COMP_STORED:
-            raise NotImplementedError("only stored compression is implemented")
+        if compression not in (Header.COMP_STORED, Header.COMP_LZ77):
+            raise NotImplementedError("compression method is not implemented")
 
         self.__encoding = encoding
+        self.__compression = compression
         ''.encode(encoding)
         self.__names = set()
         self.__exclude_paths = set()
@@ -3532,26 +3768,30 @@ class AceWriter:
             raise ValueError("archive name is too long")
         return encoded
 
-    def _file_header(self, name, size, timestamp, attribs, crc32):
+    def _file_header(self, name, size, timestamp, attribs, crc32,
+                     packsize=None, comptype=Header.COMP_STORED,
+                     compqual=Header.QUAL_NONE, params=0):
         encoded = self._encode_name(name)
-        if size > 0xFFFFFFFFFFFFFFFF:
+        if packsize is None:
+            packsize = size
+        if size > 0xFFFFFFFFFFFFFFFF or packsize > 0xFFFFFFFFFFFFFFFF:
             raise ValueError("file is too large for ACE")
-        if size > 0xFFFFFFFF:
+        if size > 0xFFFFFFFF or packsize > 0xFFFFFFFF:
             htype = Header.TYPE_FILE64
             flags = Header.FLAG_ADDSIZE | Header.FLAG_64BIT
-            sizes = struct.pack('<QQ', size, size)
+            sizes = struct.pack('<QQ', packsize, size)
         else:
             htype = Header.TYPE_FILE32
             flags = Header.FLAG_ADDSIZE
-            sizes = struct.pack('<LL', size, size)
+            sizes = struct.pack('<LL', packsize, size)
         body = struct.pack('<BH', htype, flags) + sizes + struct.pack(
                 '<LLLBBHHH',
                 _dt_todos(datetime.datetime.fromtimestamp(timestamp)),
                 attribs,
                 crc32,
-                Header.COMP_STORED,
-                Header.QUAL_NONE,
-                0,
+                comptype,
+                compqual,
+                params,
                 0,
                 len(encoded)) + encoded
         return self._header(body)
@@ -3629,28 +3869,48 @@ class AceWriter:
                 self._attributes(st, True), ace_crc32(b''))
         self.__file.write(header)
 
-    def _write_file(self, filename, name, st):
-        start = self.__file.tell()
-        placeholder = self._file_header(name, st.st_size, st.st_mtime,
-                self._attributes(st, False), 0)
-        self.__file.write(placeholder)
+    @staticmethod
+    def _crc32(data):
         crc = AceCRC32()
-        size = 0
+        for offset in range(0, len(data), FILE_BLOCKSIZE):
+            crc += data[offset:offset + FILE_BLOCKSIZE]
+        return crc.sum
+
+    def _write_data(self, data, name, timestamp, attribs):
+        size = len(data)
+        crc32 = self._crc32(data)
+        start = self.__file.tell()
+        placeholder = self._file_header(
+                name, size, timestamp, attribs, 0, packsize=0)
+        self.__file.write(placeholder)
+        data_start = self.__file.tell()
         try:
-            with builtins.open(filename, 'rb') as source:
-                while True:
-                    block = source.read(FILE_BLOCKSIZE)
-                    if not block:
-                        break
-                    self.__file.write(block)
-                    crc += block
-                    size += len(block)
-            if size != st.st_size:
-                raise OSError(
-                        "file size changed while archiving: %s" % filename)
+            comptype = Header.COMP_STORED
+            compqual = Header.QUAL_NONE
+            params = 0
+            if self.__compression == Header.COMP_LZ77 and size > 0:
+                LZ77Writer.write(self.__file, data)
+                packsize = self.__file.tell() - data_start
+                if packsize < size:
+                    comptype = Header.COMP_LZ77
+                    compqual = Header.QUAL_NORMAL
+                    params = LZ77Writer.DICBITS - LZ77.MINDICBITS
+                else:
+                    self.__file.seek(data_start)
+                    self.__file.truncate()
+                    for offset in range(0, size, FILE_BLOCKSIZE):
+                        self.__file.write(data[offset:offset + FILE_BLOCKSIZE])
+                    packsize = size
+            else:
+                for offset in range(0, size, FILE_BLOCKSIZE):
+                    self.__file.write(data[offset:offset + FILE_BLOCKSIZE])
+                packsize = size
+
             end = self.__file.tell()
-            header = self._file_header(name, size, st.st_mtime,
-                    self._attributes(st, False), crc.sum)
+            header = self._file_header(
+                    name, size, timestamp, attribs, crc32,
+                    packsize=packsize, comptype=comptype,
+                    compqual=compqual, params=params)
             assert len(header) == len(placeholder)
             self.__file.seek(start)
             self.__file.write(header)
@@ -3659,6 +3919,20 @@ class AceWriter:
             self.__file.seek(start)
             self.__file.truncate()
             raise
+
+    def _write_file(self, filename, name, st):
+        with builtins.open(filename, 'rb') as source:
+            if st.st_size == 0:
+                self._write_data(b'', name, st.st_mtime,
+                                 self._attributes(st, False))
+            else:
+                with mmap.mmap(source.fileno(), 0,
+                               access=mmap.ACCESS_READ) as data:
+                    self._write_data(data, name, st.st_mtime,
+                                     self._attributes(st, False))
+            if os.fstat(source.fileno()).st_size != st.st_size:
+                raise OSError(
+                        "file size changed while archiving: %s" % filename)
 
     def write(self, filename, arcname=None):
         """Add *filename* recursively, optionally stored as *arcname*."""
@@ -3695,12 +3969,9 @@ class AceWriter:
         pending = set()
         self._check_name(name, pending)
         now = datetime.datetime.now().timestamp()
-        header = self._file_header(name, len(data), now,
-                Header.ATTR_ARCHIVE, ace_crc32(data))
         start = self.__file.tell()
         try:
-            self.__file.write(header)
-            self.__file.write(data)
+            self._write_data(data, name, now, Header.ATTR_ARCHIVE)
             self.__names.add(name.casefold())
         except:
             self.__file.seek(start)
@@ -4356,14 +4627,14 @@ QUAL_GOOD    = Header.QUAL_GOOD
 QUAL_BEST    = Header.QUAL_BEST
 
 def open(file, mode='r', *, search=524288, encoding='cp850',
-         compression=COMP_STORED):
+         compression=COMP_LZ77):
     """
     Open an ACE archive from filename or file-like object.
     Mode ``'r'`` returns an :class:`AceArchive` for reading.  Mode ``'w'``
     returns an :class:`AceWriter` for creating a single-volume ACE 2.0 archive.
     *Encoding* selects the OEM code page used for member filenames.
-    *Search* applies to reading and *compression* applies to writing; currently
-    only :data:`COMP_STORED` compression is implemented.
+    *Search* applies to reading and *compression* applies to writing.  Writing
+    defaults to :data:`COMP_LZ77`; members which do not get smaller are stored.
     """
     if isinstance(file, os.PathLike):
         file = os.fspath(file)
@@ -4709,11 +4980,11 @@ def unace():
 
 
 def ace():
-    """Command line interface for creating stored ACE archives."""
+    """Command line interface for creating ACE archives."""
     import argparse
 
     parser = argparse.ArgumentParser(
-            description='Create stored ACE 2.0 archives')
+            description='Create ACE 2.0 archives')
     parser.add_argument('archive', type=str,
             help='archive to create')
     parser.add_argument('file', nargs='+', type=str,
@@ -4723,6 +4994,8 @@ def ace():
             help='show version and exit')
     parser.add_argument('--encoding', type=str, default='cp850', metavar='X',
             help='archive filename encoding (default: cp850)')
+    parser.add_argument('--store', action='store_true',
+            help='store files without compression')
     parser.add_argument('-v', '--verbose', action='store_true',
             help='list files as they are added')
     args = parser.parse_args()
@@ -4736,7 +5009,9 @@ def ace():
                                         suffix='.tmp', delete=False)
         temporary = f.name
         f.close()
-        with open(temporary, 'w', encoding=args.encoding) as writer:
+        compression = COMP_STORED if args.store else COMP_LZ77
+        with open(temporary, 'w', encoding=args.encoding,
+                  compression=compression) as writer:
             writer._exclude(archive)
             writer._exclude(temporary)
             for filename in args.file:
@@ -4776,4 +5051,3 @@ if __name__ == '__main__':
     if '--doctest' in sys.argv:
         test()
     unace()
-

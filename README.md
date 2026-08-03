@@ -1,4 +1,4 @@
-# acefile - read/test/extract and create stored ACE archives in pure python
+# acefile - read/test/extract and create ACE archives in pure python
 Copyright (C) 2017-2026, [Daniel Roethlisberger](//daniel.roe.ch/).  
 https://www.roe.ch/acefile  
 
@@ -29,7 +29,7 @@ native implementations, but more robust against vulnerabilities.
 This implementation supports up to version 2.0 of the ACE archive format,
 including the EXE, DELTA, PIC and SOUND modes of ACE 2.0, password protected
 archives and multi-volume archives.  It can create single-volume ACE 2.0
-archives using stored compression.
+archives using LZ77 compression with automatic stored fallback.
 It is an implementation from scratch, based on the 1998 document titled
 "Technical information of the archiver ACE v1.2" by Marcel Lemke, using
 unace 2.5 and WinAce 2.69 by Marcel Lemke as reference implementations.
@@ -107,7 +107,7 @@ reading them into memory:
 Check the [API documentation](https://apidoc.roe.ch/acefile) for a complete
 description of the API.
 
-Create a stored archive from files, directories, or bytes:
+Create a compressed archive from files, directories, or bytes:
 
     import acefile
 
@@ -119,9 +119,13 @@ Create a stored archive from files, directories, or bytes:
 
 ## Utility usage examples
 
-Create a stored archive recursively:
+Create a compressed archive recursively:
 
     acefile-ace example.ace directory README.md
+
+Store files without compression:
+
+    acefile-ace --store example.ace directory README.md
 
 Extract all files in the archive, with directories, to current working dir:
 
@@ -162,4 +166,3 @@ integration tests are currently not useful without any test archives though.
 
 Marcel Lemke for designing the ACE archive format and ACE compression and
 decompression algorithms.
-

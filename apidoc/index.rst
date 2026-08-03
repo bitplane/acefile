@@ -30,7 +30,7 @@ Functions
 
 .. autofunction:: is_acefile
 
-.. autofunction:: open(file, mode='r', \*, search=524288, encoding='cp850', compression=COMP_STORED)
+.. autofunction:: open(file, mode='r', \*, search=524288, encoding='cp850', compression=COMP_LZ77)
 
 AceArchive Class
 ~~~~~~~~~~~~~~~~
@@ -252,4 +252,3 @@ member can have a different password, but in practice most encrypted archives
 use a single password for all members.  There is no password verifier in the
 file format; the only way to verify a password is to decrypt and decompress the
 archive member and check the CRC.
-
