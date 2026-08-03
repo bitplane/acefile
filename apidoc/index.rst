@@ -30,7 +30,7 @@ Functions
 
 .. autofunction:: is_acefile
 
-.. autofunction:: open(file, mode='r', \*, search=524288, encoding='cp850')
+.. autofunction:: open(file, mode='r', \*, search=524288, encoding='cp850', compression=COMP_STORED)
 
 AceArchive Class
 ~~~~~~~~~~~~~~~~
@@ -42,6 +42,12 @@ AceMember Class
 ~~~~~~~~~~~~~~~
 
 .. autoclass:: AceMember()
+    :members:
+
+AceWriter Class
+~~~~~~~~~~~~~~~
+
+.. autoclass:: AceWriter()
     :members:
 
 Constants

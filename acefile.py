@@ -30,16 +30,18 @@
 # over ACE technology beyond the copyright of this python implementation.
 
 """
-Read/test/extract ACE 1.0 and 2.0 archives in pure python.
+Read/test/extract ACE archives and create stored ACE 2.0 archives in pure
+python.
 
 This single-file, pure python 3, no-dependencies implementation is intended
-to be used as a library, but also provides a stand-alone unace utility.
+to be used as a library, but also provides stand-alone ace and unace utilities.
 As mostly pure-python implementation, it is significantly slower than
 native implementations, but more robust against vulnerabilities.
 
 This implementation supports up to version 2.0 of the ACE archive format,
 including the EXE, DELTA, PIC and SOUND modes of ACE 2.0, password protected
-archives and multi-volume archives.  It does not support writing to archives.
+archives and multi-volume archives.  It can create single-volume ACE 2.0
+archives using stored compression.
 It is an implementation from scratch, based on the 1998 document titled
 "Technical information of the archiver ACE v1.2" by Marcel Lemke, using
 unace 2.5 and WinAce 2.69 by Marcel Lemke as reference implementations.
@@ -77,6 +79,7 @@ import re
 import stat
 import struct
 import sys
+import tempfile
 import zlib
 
 
@@ -165,6 +168,18 @@ def _dt_fromdos(dosdt):
                 ((dosdt      ) & 0x1F) * 2)
     except ValueError:
         return datetime.datetime(1980, 1, 1, 0, 0, 0)
+
+
+def _dt_todos(dt):
+    """Convert a datetime object to an MS-DOS format timestamp."""
+    dt = min(max(dt, datetime.datetime(1980, 1, 1)),
+             datetime.datetime(2107, 12, 31, 23, 59, 58))
+    return (((dt.year - 1980) << 25) |
+            (dt.month << 21) |
+            (dt.day << 16) |
+            (dt.hour << 11) |
+            (dt.minute << 5) |
+            (dt.second // 2))
 
 
 
@@ -3410,6 +3425,314 @@ class AceVolume:
 
 
 
+class AceWriter:
+    """
+    Create a single-volume ACE 2.0 archive using stored compression.
+
+    Instances are returned by calling :func:`acefile.open` with mode ``'w'``.
+
+    >>> f = io.BytesIO()
+    >>> with open(f, 'w') as archive:
+    ...     archive.writestr('café.txt', b'hello')
+    >>> f.seek(0)
+    0
+    >>> with open(f) as archive:
+    ...     archive.getnames(), archive.read('café.txt')
+    (['café.txt'], b'hello')
+    """
+
+    def __init__(self, file, mode='w', *, encoding='cp850',
+                 compression=Header.COMP_STORED):
+        if mode != 'w':
+            raise ValueError("mode must be 'w'")
+        if compression != Header.COMP_STORED:
+            raise NotImplementedError("only stored compression is implemented")
+
+        self.__encoding = encoding
+        ''.encode(encoding)
+        self.__names = set()
+        self.__exclude_paths = set()
+        self.__closed = False
+        self.__owned = isinstance(file, (str, bytes, os.PathLike))
+        self.__filename = os.fspath(file) if self.__owned else getattr(
+                file, 'name', None)
+        self.__output_path = os.path.realpath(self.__filename) \
+                if self.__owned else None
+        if self.__output_path != None:
+            self.__exclude_paths.add(self.__output_path)
+        if self.__owned:
+            self.__file = builtins.open(os.fspath(file), 'w+b')
+        else:
+            self.__file = file
+            if not file.writable() or not file.seekable():
+                raise ValueError("output must be writable and seekable")
+            file.seek(0)
+            file.truncate()
+        try:
+            self.__file.write(self._main_header())
+        except:
+            if self.__owned:
+                self.__file.close()
+            raise
+
+    @staticmethod
+    def _header(body):
+        if len(body) > 0xFFFF:
+            raise ValueError("ACE header is too large")
+        return struct.pack('<HH', ace_crc16(body), len(body)) + body
+
+    @staticmethod
+    def _main_header():
+        body = struct.pack('<BH7sBBBBL8s',
+                Header.TYPE_MAIN,
+                Header.FLAG_V20FORMAT,
+                Header.MAGIC,
+                20,
+                20,
+                Header.HOST_WIN32,
+                0,
+                _dt_todos(datetime.datetime.now()),
+                b'\0' * 8)
+        return AceWriter._header(body)
+
+    @staticmethod
+    def _attributes(st, is_dir):
+        attribs = Header.ATTR_DIRECTORY if is_dir else Header.ATTR_ARCHIVE
+        if not st.st_mode & stat.S_IWUSR:
+            attribs |= Header.ATTR_READONLY
+        return attribs
+
+    @staticmethod
+    def _normalize_arcname(name):
+        name = os.fspath(name)
+        if isinstance(name, bytes):
+            name = os.fsdecode(name)
+        _, name = os.path.splitdrive(name)
+        name = name.replace('\\', '/')
+        name = name.lstrip('/')
+        parts = []
+        for part in name.split('/'):
+            if part in ('', '.'):
+                continue
+            if part == '..':
+                raise ValueError("archive name contains '..'")
+            if '\0' in part:
+                raise ValueError("archive name contains a null byte")
+            if any(char in AceMember.RESERVED_CHARS for char in part):
+                raise ValueError("archive name contains a reserved character")
+            parts.append(part)
+        if not parts:
+            raise ValueError("archive name is empty")
+        return '\\'.join(parts)
+
+    def _encode_name(self, name):
+        encoded = name.encode(self.__encoding)
+        fixed_size = 3 + 16 + 20
+        if len(encoded) > 0xFFFF or fixed_size + len(encoded) > 0xFFFF:
+            raise ValueError("archive name is too long")
+        return encoded
+
+    def _file_header(self, name, size, timestamp, attribs, crc32):
+        encoded = self._encode_name(name)
+        if size > 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("file is too large for ACE")
+        if size > 0xFFFFFFFF:
+            htype = Header.TYPE_FILE64
+            flags = Header.FLAG_ADDSIZE | Header.FLAG_64BIT
+            sizes = struct.pack('<QQ', size, size)
+        else:
+            htype = Header.TYPE_FILE32
+            flags = Header.FLAG_ADDSIZE
+            sizes = struct.pack('<LL', size, size)
+        body = struct.pack('<BH', htype, flags) + sizes + struct.pack(
+                '<LLLBBHHH',
+                _dt_todos(datetime.datetime.fromtimestamp(timestamp)),
+                attribs,
+                crc32,
+                Header.COMP_STORED,
+                Header.QUAL_NONE,
+                0,
+                0,
+                len(encoded)) + encoded
+        return self._header(body)
+
+    def _check_name(self, name, pending):
+        self._encode_name(name)
+        folded = name.casefold()
+        if folded in self.__names or folded in pending:
+            raise ValueError("duplicate archive name: %s" % name)
+        pending.add(folded)
+
+    def _entries(self, filename, arcname):
+        filename = os.fspath(filename)
+        real_filename = os.path.realpath(filename)
+        if real_filename == self.__output_path:
+            raise ValueError("cannot add archive to itself")
+        if real_filename in self.__exclude_paths:
+            return []
+        rootname = self._normalize_arcname(
+                filename if arcname is None else arcname)
+        st = os.lstat(filename)
+        if stat.S_ISLNK(st.st_mode):
+            raise ValueError("symbolic links are not supported: %s" % filename)
+        if stat.S_ISREG(st.st_mode):
+            return [(filename, rootname, st, False)]
+        if not stat.S_ISDIR(st.st_mode):
+            raise ValueError("unsupported file type: %s" % filename)
+
+        entries = [(filename, rootname, st, True)]
+        walk = os.walk(filename, followlinks=False,
+                       onerror=self._raise_walk_error)
+        for root, dirnames, filenames in walk:
+            dirnames.sort()
+            filenames.sort()
+            dirnames[:] = [name for name in dirnames
+                    if os.path.realpath(os.path.join(root, name)) not in
+                    self.__exclude_paths]
+            filenames[:] = [name for name in filenames
+                    if os.path.realpath(os.path.join(root, name)) not in
+                    self.__exclude_paths]
+            for basename in list(dirnames):
+                path = os.path.join(root, basename)
+                childst = os.lstat(path)
+                if stat.S_ISLNK(childst.st_mode):
+                    raise ValueError(
+                            "symbolic links are not supported: %s" % path)
+                if not stat.S_ISDIR(childst.st_mode):
+                    raise ValueError("unsupported file type: %s" % path)
+                relative = os.path.relpath(path, filename).replace(os.sep, '\\')
+                entries.append((path, rootname + '\\' + relative,
+                                childst, True))
+            for basename in filenames:
+                path = os.path.join(root, basename)
+                childst = os.lstat(path)
+                if stat.S_ISLNK(childst.st_mode):
+                    raise ValueError(
+                            "symbolic links are not supported: %s" % path)
+                if not stat.S_ISREG(childst.st_mode):
+                    raise ValueError("unsupported file type: %s" % path)
+                relative = os.path.relpath(path, filename).replace(os.sep, '\\')
+                entries.append((path, rootname + '\\' + relative,
+                                childst, False))
+        return entries
+
+    @staticmethod
+    def _raise_walk_error(error):
+        raise error
+
+    def _exclude(self, filename):
+        """Exclude a path from recursive traversal (used by the CLI)."""
+        self.__exclude_paths.add(os.path.realpath(os.fspath(filename)))
+
+    def _write_directory(self, name, st):
+        header = self._file_header(name, 0, st.st_mtime,
+                self._attributes(st, True), ace_crc32(b''))
+        self.__file.write(header)
+
+    def _write_file(self, filename, name, st):
+        start = self.__file.tell()
+        placeholder = self._file_header(name, st.st_size, st.st_mtime,
+                self._attributes(st, False), 0)
+        self.__file.write(placeholder)
+        crc = AceCRC32()
+        size = 0
+        try:
+            with builtins.open(filename, 'rb') as source:
+                while True:
+                    block = source.read(FILE_BLOCKSIZE)
+                    if not block:
+                        break
+                    self.__file.write(block)
+                    crc += block
+                    size += len(block)
+            if size != st.st_size:
+                raise OSError(
+                        "file size changed while archiving: %s" % filename)
+            end = self.__file.tell()
+            header = self._file_header(name, size, st.st_mtime,
+                    self._attributes(st, False), crc.sum)
+            assert len(header) == len(placeholder)
+            self.__file.seek(start)
+            self.__file.write(header)
+            self.__file.seek(end)
+        except:
+            self.__file.seek(start)
+            self.__file.truncate()
+            raise
+
+    def write(self, filename, arcname=None):
+        """Add *filename* recursively, optionally stored as *arcname*."""
+        self._check_open()
+        entries = self._entries(filename, arcname)
+        pending = set()
+        for _, name, _, _ in entries:
+            self._check_name(name, pending)
+        start = self.__file.tell()
+        added = []
+        try:
+            for path, name, st, is_dir in entries:
+                if is_dir:
+                    self._write_directory(name, st)
+                else:
+                    self._write_file(path, name, st)
+                folded = name.casefold()
+                self.__names.add(folded)
+                added.append(folded)
+        except:
+            self.__file.seek(start)
+            self.__file.truncate()
+            for folded in added:
+                self.__names.remove(folded)
+            raise
+
+    def writestr(self, arcname, data):
+        """Add bytes-like *data* as archive member *arcname*."""
+        self._check_open()
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError("data must be bytes-like")
+        data = bytes(data)
+        name = self._normalize_arcname(arcname)
+        pending = set()
+        self._check_name(name, pending)
+        now = datetime.datetime.now().timestamp()
+        header = self._file_header(name, len(data), now,
+                Header.ATTR_ARCHIVE, ace_crc32(data))
+        start = self.__file.tell()
+        try:
+            self.__file.write(header)
+            self.__file.write(data)
+            self.__names.add(name.casefold())
+        except:
+            self.__file.seek(start)
+            self.__file.truncate()
+            raise
+
+    def _check_open(self):
+        if self.__closed:
+            raise ValueError("I/O operation on closed ACE archive")
+
+    def close(self):
+        """Flush and close this writer.  Calling close repeatedly is safe."""
+        if self.__closed:
+            return
+        self.__closed = True
+        try:
+            self.__file.flush()
+        finally:
+            if self.__owned:
+                self.__file.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.close()
+
+    @property
+    def filename(self):
+        return self.__filename
+
+
 class AceArchive:
     """
     Represents an ACE archive, possibly consisting of multiple volumes.
@@ -4032,7 +4355,24 @@ QUAL_GOOD    = Header.QUAL_GOOD
 #: The compression quality constant for best compression.
 QUAL_BEST    = Header.QUAL_BEST
 
-open = AceArchive._open
+def open(file, mode='r', *, search=524288, encoding='cp850',
+         compression=COMP_STORED):
+    """
+    Open an ACE archive from filename or file-like object.
+    Mode ``'r'`` returns an :class:`AceArchive` for reading.  Mode ``'w'``
+    returns an :class:`AceWriter` for creating a single-volume ACE 2.0 archive.
+    *Encoding* selects the OEM code page used for member filenames.
+    *Search* applies to reading and *compression* applies to writing; currently
+    only :data:`COMP_STORED` compression is implemented.
+    """
+    if isinstance(file, os.PathLike):
+        file = os.fspath(file)
+    if mode == 'r':
+        return AceArchive._open(file, mode, search=search, encoding=encoding)
+    if mode == 'w':
+        return AceWriter(file, mode, encoding=encoding,
+                         compression=compression)
+    raise ValueError("mode must be 'r' or 'w'")
 
 __all__ = ['is_acefile', 'open']
 __all__.extend(filter(lambda name: name.startswith('COMP_'),
@@ -4364,6 +4704,56 @@ def unace():
             raise
         eprint("%s: %s: %s" % (args.archive, type(e).__name__, e))
         sys.exit(1)
+
+    sys.exit(0)
+
+
+def ace():
+    """Command line interface for creating stored ACE archives."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+            description='Create stored ACE 2.0 archives')
+    parser.add_argument('archive', type=str,
+            help='archive to create')
+    parser.add_argument('file', nargs='+', type=str,
+            help='file(s) or directories to add')
+    parser.add_argument('-V', '--version', action='version',
+            version='acefile %s' % __version__,
+            help='show version and exit')
+    parser.add_argument('--encoding', type=str, default='cp850', metavar='X',
+            help='archive filename encoding (default: cp850)')
+    parser.add_argument('-v', '--verbose', action='store_true',
+            help='list files as they are added')
+    args = parser.parse_args()
+
+    archive = os.path.abspath(args.archive)
+    parent = os.path.dirname(archive)
+    prefix = '.%s.' % os.path.basename(archive)
+    temporary = None
+    try:
+        f = tempfile.NamedTemporaryFile(dir=parent, prefix=prefix,
+                                        suffix='.tmp', delete=False)
+        temporary = f.name
+        f.close()
+        with open(temporary, 'w', encoding=args.encoding) as writer:
+            writer._exclude(archive)
+            writer._exclude(temporary)
+            for filename in args.file:
+                writer.write(filename)
+                if args.verbose:
+                    eprint(filename)
+        os.replace(temporary, archive)
+        temporary = None
+    except (AceError, LookupError, OSError, TypeError, ValueError) as e:
+        eprint('%s: %s' % (os.path.basename(sys.argv[0]), e))
+        sys.exit(1)
+    finally:
+        if temporary != None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
     sys.exit(0)
 

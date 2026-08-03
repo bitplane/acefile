@@ -1,4 +1,4 @@
-# acefile - read/test/extract ACE 1.0 and 2.0 archives in pure python
+# acefile - read/test/extract and create stored ACE archives in pure python
 Copyright (C) 2017-2026, [Daniel Roethlisberger](//daniel.roe.ch/).  
 https://www.roe.ch/acefile  
 
@@ -12,6 +12,9 @@ https://www.roe.ch/acefile
     with acefile.open('example.ace') as f:
         f.extractall()
 
+    with acefile.open('example.ace', 'w') as f:
+        f.write('directory')
+
     # unace utility
     acefile-unace -x example.ace
 
@@ -19,13 +22,14 @@ https://www.roe.ch/acefile
 ## Overview
 
 This single-file, pure python 3, no-dependencies implementation is intended
-to be used as a library, but also provides a stand-alone unace utility.
+to be used as a library, but also provides stand-alone ace and unace utilities.
 As mostly pure-python implementation, it is significantly slower than
 native implementations, but more robust against vulnerabilities.
 
 This implementation supports up to version 2.0 of the ACE archive format,
 including the EXE, DELTA, PIC and SOUND modes of ACE 2.0, password protected
-archives and multi-volume archives.  It does not support writing to archives.
+archives and multi-volume archives.  It can create single-volume ACE 2.0
+archives using stored compression.
 It is an implementation from scratch, based on the 1998 document titled
 "Technical information of the archiver ACE v1.2" by Marcel Lemke, using
 unace 2.5 and WinAce 2.69 by Marcel Lemke as reference implementations.
@@ -103,8 +107,21 @@ reading them into memory:
 Check the [API documentation](https://apidoc.roe.ch/acefile) for a complete
 description of the API.
 
+Create a stored archive from files, directories, or bytes:
+
+    import acefile
+
+    with acefile.open('example.ace', 'w') as f:
+        f.write('directory')
+        f.write('README.md', arcname='docs/README.md')
+        f.writestr('generated.txt', b'generated contents')
+
 
 ## Utility usage examples
+
+Create a stored archive recursively:
+
+    acefile-ace example.ace directory README.md
 
 Extract all files in the archive, with directories, to current working dir:
 

@@ -1,5 +1,7 @@
 ### Unreleased
 
+-   Add creation of single-volume ACE 2.0 archives using stored compression,
+    including a library API and `acefile-ace` command line utility.
 -   Decode archive member filenames as CP850 by default and allow callers to
     select a different filename encoding.
 

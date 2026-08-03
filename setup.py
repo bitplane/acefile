@@ -53,6 +53,7 @@ def run_setup(with_optional_extensions):
         ext_modules=ext_modules,
         entry_points={
             'console_scripts': [
+                'acefile-ace=acefile:ace',
                 'acefile-unace=acefile:unace',
             ],
         },
